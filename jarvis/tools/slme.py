@@ -702,13 +702,12 @@ class SolarCell(MSONable):
         """
         try:
             vasprun = Vasprun(filename, parse_potcar_file=False)
+            diel_tensor = DielTensor.from_file(filename)
         except ParseError:
             raise IOError("Error while parsing the input file. Currently the "
                           "SolarCell class can only be constructed from "
                           "the vasprun.xml file. If you have provided this "
                           "file, check if the run has completed.")
-
-        diel_tensor = DielTensor(vasprun.dielectric)
 
         # Extract the information on the direct and indirect band gap
         bandstructure = vasprun.get_band_structure()
