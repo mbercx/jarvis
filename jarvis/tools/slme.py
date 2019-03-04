@@ -136,7 +136,7 @@ class DielTensor(MSONable):
         and cell construction.
 
         Args:
-            thickness (float): Thickness of the absorber layer.
+            thickness (float): Thickness of the absorber layer, expressed in meters.
             method (str): Method for calculating the absorptivity.
 
         Returns:
