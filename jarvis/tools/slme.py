@@ -6,12 +6,13 @@ from __future__ import unicode_literals, print_function
 # Distributed under the terms of the GNU License
 # Initially forked and (extensively) adjusted from https://github.com/ldwillia/SL3ME
 
-import os, math, cmath, json
+import os, math, cmath, json, warnings
 
 import numpy as np
 import matplotlib.pyplot as plt
 import scipy.constants as constants
 
+from scipy.io import FortranFile
 from scipy.interpolate import interp1d
 from scipy.integrate import simps
 from scipy.constants import physical_constants, speed_of_light
@@ -36,6 +37,13 @@ k = constants.k  # Boltzmann's constant J/K
 k_e = constants.k / constants.e  # Boltzmann's constant eV/K
 e = constants.e  # Coulomb
 
+
+class Waveder(MSONable):
+    """
+    Class that represents a VASP WAVEDER file.
+
+    """
+    pass
 
 
 class DielTensor(MSONable):
@@ -841,6 +849,144 @@ class SolarCell(MSONable):
 
         return efficiency, j_sc, j_0
 
+# Code in testing phase
+def gaussian(x, mu=0, sig=0.2):
+    return np.exp(-np.power(x - mu, 2.) / (2 * np.power(sig, 2.)))
+
+
+def kkr(de, eps_imag, cshift=1e-6):
+    eps_imag = np.array(eps_imag)
+    nedos = eps_imag.shape[0]
+    eps_real = []
+    for i_r in range(nedos):
+        w_r = de * i_r
+        total = np.zeros(eps_imag.shape[1:], dtype=np.complex_)
+
+        for i_i in range(nedos):
+            w_i = de * i_i
+            val = eps_imag[i_i] * ((1. / (w_r - w_i - complex(0, cshift)))
+                                   + (1. / (- w_r - w_i + complex(0, cshift)))) * (-0.5)
+            total += val
+        eps_real.append(total * (2 / np.pi) * de + np.diag([1, 1, 1]))
+    return np.real(np.array(eps_real))
+
+
+def get_waveder_eps2(vasprun_file='', waveder_file='', alpha=0, beta=0):
+    """
+    alpha, beta: cartesian directions
+    """
+    warnings.warn("This code is still under heavy development and should be used with "
+                  "care.", Warning)
+
+    with FortranFile(waveder_file, 'r') as waveder:
+        (nbands, nbands_cder, number_kpoints, ispin) = waveder.read_reals(dtype=np.int32)
+        nodes_in_dielectric_function = waveder.read_reals(dtype=np.float)
+        wplasmon = (waveder.read_reals(dtype=np.float))
+        cder = np.array((waveder.read_reals(dtype=np.float)))
+
+    # (f_n-f_m) delta(w-(e_m-e_n)) (e 4 pi^2 e^2/volume) <u_m| -i d/dk_j u_n> <u_m|  -i
+    # d/dk_j u_n>^*
+    a = cder.reshape((nbands, nbands_cder, number_kpoints, ispin, 3))
+
+    vasprun = Vasprun(vasprun_file)
+
+    nedos = vasprun.parameters['NEDOS']
+    volume = vasprun.structures[-1].volume
+    complete_dos = vasprun.complete_dos
+
+    dos_en = complete_dos.energies
+
+    totup = complete_dos.get_densities(spin=Spin.up)
+
+    # Set up constant for calculation of dielectric tensor
+    AUTOA = 0.529177249
+    RYTOEV = 13.605826
+    FELECT = 2 * AUTOA * RYTOEV  # =e^2 #*4*np.pi*np.pi*elementary_charge#*elementary_charge
+    const = 4 * np.pi * constants.elementary_charge * 1e30 / float(volume)
+    # const=4*np.pi*np.pi*elementary_charge*1e30/float(vol)
+
+
+    nelect = int(vasprun.parameters['NELECT'])
+    kp_wts = vasprun.actual_kpoints_weights
+    nkpts = len(kp_wts)
+
+    eigvals = np.zeros((ispin, nkpts, nbands))
+    kp = []
+    for spin, d in vasprun.eigenvalues.items():
+        count = 0
+        for k, val in enumerate(d):
+            spinn = (str(spin[0]))
+            if spinn == '1':
+                spinn = 0
+            else:
+                spinn = 1
+            kp.append(spin[1])
+            eigvals[spinn, spin[1], count] = val[0]
+            count = count + 1
+
+
+
+    nb_val = int(nelect / 2.0)
+
+    # CELLVOL=OMEGA/AUTOA**3
+
+    x = []
+    y = []
+    eps = np.zeros((nedos, 3, 3))
+    for w in range(0, nedos, 20):
+        if (dos_en[w] >= 1) and dos_en[w] < 10:  # >1.0 and dos_en[w]<10.0:
+            for i in range(0, nkpts):
+                for vasprun in range(0, nb_val):
+                    for c in range(nb_val, nbands):
+                        band_en_diff = eigvals[0][i][c] - eigvals[0][i][vasprun] - dos_en[w]
+                        gaus = gaussian(band_en_diff)
+                        tmp = 2 * kp_wts[i] * gaus * a[c][vasprun][k][0][alpha] * np.conjugate(
+                            a[c][vasprun][k][0][beta])
+                        eps[w][alpha][beta] += tmp * const
+                        # eps[w][alpha][beta]+=tmp*const/5.15685452
+                        # eps[w][alpha][beta]+=tmp*FELECT/float(vol)*1e10
+            print(dos_en[w], eps[w][alpha][beta])
+            x.append(dos_en[w])
+            y.append(eps[w][alpha][beta])
+
+    # EPSILON_IMAG_TET(
+    # WDES,
+    # W0        -> Unperturved wavefunctions?
+    # CHAM1     -> derivative of orbital in i direction
+    # CHAM2     -> derivative of orbital in j direction
+    # EMAX,
+    # NEDOS     -> number of energy gridpoints
+    # DOS       -> Density of States
+    # DELTAE    -> Energy mesh spacing
+    # OMEGA,
+    # IO,
+    # INFO,
+    # KPOINTS
+    # )
+    #
+    # FERTOT -> occupancies
+    #
+    # DO NK = 1, NKPTS
+    #     DO N1 = 1, NBVAL
+    #         DO N2 = 1, NBCON
+    #             J = (N1 - 1) * NBCON + N2
+    #             NC = NBFULL + N2
+    #             IF(NC > N1)
+    #                 AMP(J, NK, 1) = GCONJG(CHAM1(NC, N1, NK, ISP)) * CHAM2(NC, N1, NK, ISP) * CONST *
+    #                 (W0 % FERTOT(N1, NK, ISP) - W0 % FERTOT(NC, NK, ISP))
+    #                 ETRANS(J, NK, 1) = W0 % CELTOT(NC, NK, ISP) - W0 % CELTOT(N1, NK, ISP)
+    #         ENDDO
+    #     ENDDO
+    # ENDDO
+
+    for i in range(nkpts):
+        for i in range(nbval):
+            for i in range(nbcon):
+
+                pass
+
+
+
 
 # Utility method
 def to_matrix(xx, yy, zz, xy, yz, xz):
@@ -863,7 +1009,7 @@ def to_matrix(xx, yy, zz, xy, yz, xz):
     matrix = np.array([[xx, xy, xz], [xy, yy, yz], [xz, yz, zz]])
     return matrix
 
-
+# region
 ######################################
 # Previous code, kept for comparison #
 ######################################
@@ -1273,3 +1419,5 @@ if __name__ == '__main__':
     print('SLME', 100 * eff)
     eff = calculate_SQ(indirgap)
     print('SQ', 100 * eff)
+
+# endregion
