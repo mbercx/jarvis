@@ -684,7 +684,7 @@ class SolarCell(MSONable):
             plt.legend(("SLME", "SQ"))
         else:
             plt.legend(("SLME",))
-        plt.xlabel("Thicknesss (m)")
+        plt.xlabel("Thickness (m)")
         plt.ylabel("Efficiency")
         plt.xscale("log")
 
@@ -978,12 +978,12 @@ def get_waveder_eps2(vasprun_file='', waveder_file='', alpha=0, beta=0):
     #         ENDDO
     #     ENDDO
     # ENDDO
-
-    for i in range(nkpts):
-        for i in range(nbval):
-            for i in range(nbcon):
-
-                pass
+    #
+    # for i in range(nkpts):
+    #     for i in range(nbval):
+    #         for i in range(nbcon):
+    #
+    #             pass
 
 
 
