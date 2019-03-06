@@ -880,16 +880,6 @@ def get_waveder_eps2(vasprun_file='', waveder_file='', alpha=0, beta=0):
     warnings.warn("This code is still under heavy development and should be used with "
                   "care.", Warning)
 
-    # Notes about the VASP code
-    #
-    # 1. My god, that is some unreadable fucking code.
-    # 2. Constants:
-    #
-    #   AUTOA  = 1. a.u. in Angstroem
-    #   RYTOEV = 1 Ry in Ev
-    #   PI = The number pi
-    #   TPI = 2*pi (I'm not kidding)
-
     with FortranFile(waveder_file, 'r') as waveder:
         (nbands, nbands_cder, number_kpoints, ispin) = waveder.read_reals(dtype=np.int32)
         nodes_in_dielectric_function = waveder.read_reals(dtype=np.float)
@@ -974,6 +964,7 @@ def get_waveder_eps2(vasprun_file='', waveder_file='', alpha=0, beta=0):
                     transition_en_diff = \
                         eig[spin][kpoint][cond_band][0] - eig[spin][kpoint][val_band][0]
 
+                    # Calculate the transition amplitude
                     if spin is Spin.up:
                         matrix_product = np.conjugate(
                             cder[cond_band][val_band][kpoint][0][alpha]
@@ -990,6 +981,16 @@ def get_waveder_eps2(vasprun_file='', waveder_file='', alpha=0, beta=0):
 
     return transitions
 
+    # Some notes about the VASP code
+    #
+    # 1. My god, that is some unreadable fucking code.
+    # 2. Constants:
+    #
+    #   AUTOA  = 1. a.u. in Angstroem
+    #   RYTOEV = 1 Ry in Ev
+    #   PI = The number pi
+    #   TPI = 2*pi (I'm not kidding)
+    #
     # The VASP code, for reference:
     #
     # CALL EPSILON_IMAG_TET(WDES, W0, CHAM(:,:,:,:, IDIR), CHAM(:,:,:,:, JDIR), EMAX, &
