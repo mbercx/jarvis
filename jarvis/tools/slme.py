@@ -850,6 +850,7 @@ class SolarCell(MSONable):
         return efficiency, j_sc, j_0
 
 # Code in testing phase
+
 def gaussian(x, mu=0, sig=0.2):
     return np.exp(-np.power(x - mu, 2.) / (2 * np.power(sig, 2.)))
 
@@ -878,6 +879,16 @@ def get_waveder_eps2(vasprun_file='', waveder_file='', alpha=0, beta=0):
     warnings.warn("This code is still under heavy development and should be used with "
                   "care.", Warning)
 
+    # Notes about the VASP code
+    #
+    # 1. My god, that is some unreadable fucking code.
+    # 2. Constants:
+    #
+    #   AUTOA  = 1. a.u. in Angstroem
+    #   RYTOEV = 1 Ry in Ev
+    #   PI = The number pi
+    #   TPI = 2*pi (I'm not kidding)
+
     with FortranFile(waveder_file, 'r') as waveder:
         (nbands, nbands_cder, number_kpoints, ispin) = waveder.read_reals(dtype=np.int32)
         nodes_in_dielectric_function = waveder.read_reals(dtype=np.float)
@@ -886,7 +897,8 @@ def get_waveder_eps2(vasprun_file='', waveder_file='', alpha=0, beta=0):
 
     # (f_n-f_m) delta(w-(e_m-e_n)) (e 4 pi^2 e^2/volume) <u_m| -i d/dk_j u_n> <u_m|  -i
     # d/dk_j u_n>^*
-    a = cder.reshape((nbands, nbands_cder, number_kpoints, ispin, 3))
+
+    cder = cder.reshape((nbands, nbands_cder, number_kpoints, ispin, 3))
 
     vasprun = Vasprun(vasprun_file)
 
@@ -899,12 +911,20 @@ def get_waveder_eps2(vasprun_file='', waveder_file='', alpha=0, beta=0):
     totup = complete_dos.get_densities(spin=Spin.up)
 
     # Set up constant for calculation of dielectric tensor
-    AUTOA = 0.529177249
-    RYTOEV = 13.605826
-    FELECT = 2 * AUTOA * RYTOEV  # =e^2 #*4*np.pi*np.pi*elementary_charge#*elementary_charge
-    const = 4 * np.pi * constants.elementary_charge * 1e30 / float(volume)
-    # const=4*np.pi*np.pi*elementary_charge*1e30/float(vol)
+    # From linear_optics.F:
+    # CONST = RYTOEV * 2 * AUTOA * TPI * PI / OMEGA * WDES % RSPIN
 
+    # AUTOA  = 1. a.u. in Angstroem
+    au_to_angstrom = constants.physical_constants["Bohr radius"]*1e10
+
+    # RYTOEV = 1 Ry in Ev
+    ry_to_ev = constants.Rydberg * constants.speed_of_light * constants.h / \
+               constants.elementary_charge
+
+    # WDES % RSPIN = Spin multiplicity (2 for non-spin polarised)
+    spin_multiplicity = 2
+
+    constant = 4 * constants.pi * ry_to_ev * au_to_angstrom * spin_multiplicity / volume
 
     nelect = int(vasprun.parameters['NELECT'])
     kp_wts = vasprun.actual_kpoints_weights
@@ -924,41 +944,48 @@ def get_waveder_eps2(vasprun_file='', waveder_file='', alpha=0, beta=0):
             eigvals[spinn, spin[1], count] = val[0]
             count = count + 1
 
-
-
-    nb_val = int(nelect / 2.0)
+    nb_val = int(nelect / 2.0) # This assumes a non-spin-polarized calculation
 
     # CELLVOL=OMEGA/AUTOA**3
 
     x = []
     y = []
     eps = np.zeros((nedos, 3, 3))
-    for w in range(0, nedos, 20):
-        if (dos_en[w] >= 1) and dos_en[w] < 10:  # >1.0 and dos_en[w]<10.0:
-            for i in range(0, nkpts):
-                for vasprun in range(0, nb_val):
-                    for c in range(nb_val, nbands):
-                        band_en_diff = eigvals[0][i][c] - eigvals[0][i][vasprun] - dos_en[w]
-                        gaus = gaussian(band_en_diff)
-                        tmp = 2 * kp_wts[i] * gaus * a[c][vasprun][k][0][alpha] * np.conjugate(
-                            a[c][vasprun][k][0][beta])
-                        eps[w][alpha][beta] += tmp * const
-                        # eps[w][alpha][beta]+=tmp*const/5.15685452
-                        # eps[w][alpha][beta]+=tmp*FELECT/float(vol)*1e10
-            print(dos_en[w], eps[w][alpha][beta])
-            x.append(dos_en[w])
-            y.append(eps[w][alpha][beta])
 
+    for energy in range(0, nedos, 20):
+
+        for kpoint in range(0, nkpts):
+
+            for val_band in range(0, nb_val):
+
+                for cond_band in range(nb_val + 1, nbands + 1):
+
+                    band_en_diff = eigvals[0][kpoint][c] \
+                                   - eigvals[0][kpoint][vasprun] - dos_en[energy]
+
+                    tmp = 2 * kp_wts[kpoint] * cder[c][vasprun][k][0][alpha] * \
+                         np.conjugate(
+                        cder[c][vasprun][k][0][beta])
+
+                    eps[energy][alpha][beta] += tmp * const
+
+        print(dos_en[energy], eps[energy][alpha][beta])
+        x.append(dos_en[energy])
+        y.append(eps[energy][alpha][beta])
+
+    # CALL EPSILON_IMAG_TET(WDES, W0, CHAM(:,:,:,:, IDIR), CHAM(:,:,:,:, JDIR), EMAX, &
+    # NEDOS, EPSDD(:, IDIR, JDIR), DELTAE, LATT_CUR % OMEGA, IO, INFO, KPOINTS)
+    #
     # EPSILON_IMAG_TET(
     # WDES,
     # W0        -> Unperturved wavefunctions?
-    # CHAM1     -> derivative of orbital in i direction
-    # CHAM2     -> derivative of orbital in j direction
+    # CHAM1     -> derivatives of orbital in i direction
+    # CHAM2     -> derivatives of orbital in j direction
     # EMAX,
     # NEDOS     -> number of energy gridpoints
-    # DOS       -> Density of States
+    # DOS       -> Density of States (EPSDD(:,IDIR,JDIR) in call?)
     # DELTAE    -> Energy mesh spacing
-    # OMEGA,
+    # OMEGA,    -> energy grid
     # IO,
     # INFO,
     # KPOINTS
@@ -984,7 +1011,25 @@ def get_waveder_eps2(vasprun_file='', waveder_file='', alpha=0, beta=0):
     #         for i in range(nbcon):
     #
     #             pass
-
+    # for energy in range(0, nedos, 20):
+    #
+    #     if (dos_en[energy] >= 1) and dos_en[energy] < 10:  # >1.0 and dos_en[w]<10.0:
+    #
+    #         for i in range(0, nkpts):
+    #             for vasprun in range(0, nb_val):
+    #                 for c in range(nb_val, nbands):
+    #                     band_en_diff = eigvals[0][i][c] - eigvals[0][i][vasprun] - dos_en[
+    #                         energy]
+    #                     gaus = gaussian(band_en_diff)
+    #                     tmp = 2 * kp_wts[i] * gaus * a[c][vasprun][k][0][
+    #                         alpha] * np.conjugate(
+    #                         a[c][vasprun][k][0][beta])
+    #                     eps[energy][alpha][beta] += tmp * const
+    #                     # eps[w][alpha][beta]+=tmp*const/5.15685452
+    #                     # eps[w][alpha][beta]+=tmp*FELECT/float(vol)*1e10
+    #         print(dos_en[energy], eps[energy][alpha][beta])
+    #         x.append(dos_en[energy])
+    #         y.append(eps[energy][alpha][beta])
 
 
 
