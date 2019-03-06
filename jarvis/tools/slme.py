@@ -253,7 +253,7 @@ class DielTensor(MSONable):
         energies = np.array(d["energies"]["data"])
         real_diel = np.array(d["real_diel"]["data"])
         imag_diel = np.array(d["imag_diel"]["data"])
-        return cls(energies, real_diel + 1j*imag_diel)
+        return cls(energies, real_diel + 1j * imag_diel)
 
     def to(self, filename):
         """
@@ -849,6 +849,7 @@ class SolarCell(MSONable):
 
         return efficiency, j_sc, j_0
 
+
 # Code in testing phase
 
 def gaussian(x, mu=0, sig=0.2):
@@ -895,84 +896,102 @@ def get_waveder_eps2(vasprun_file='', waveder_file='', alpha=0, beta=0):
         wplasmon = (waveder.read_reals(dtype=np.float))
         cder = np.array((waveder.read_reals(dtype=np.float)))
 
-    # (f_n-f_m) delta(w-(e_m-e_n)) (e 4 pi^2 e^2/volume) <u_m| -i d/dk_j u_n> <u_m|  -i
-    # d/dk_j u_n>^*
-
     cder = cder.reshape((nbands, nbands_cder, number_kpoints, ispin, 3))
 
+    # Extract the required data from the vasprun file
     vasprun = Vasprun(vasprun_file)
 
     nedos = vasprun.parameters['NEDOS']
+    nelect = int(vasprun.parameters['NELECT'])
+    kpoints = vasprun.actual_kpoints
+    kp_weights = vasprun.actual_kpoints_weights
     volume = vasprun.structures[-1].volume
-    complete_dos = vasprun.complete_dos
+    nb_val = int(nelect / 2.0)
+    nb_cond = nbands - nb_val
 
-    dos_en = complete_dos.energies
-
-    totup = complete_dos.get_densities(spin=Spin.up)
-
-    # Set up constant for calculation of dielectric tensor
+    # Set up the coefficient for the calculation of dielectric tensor
     # From linear_optics.F:
     # CONST = RYTOEV * 2 * AUTOA * TPI * PI / OMEGA * WDES % RSPIN
 
     # AUTOA  = 1. a.u. in Angstroem
-    au_to_angstrom = constants.physical_constants["Bohr radius"]*1e10
+    au_to_angstrom = constants.physical_constants["Bohr radius"][0] * 1e10
 
     # RYTOEV = 1 Ry in Ev
     ry_to_ev = constants.Rydberg * constants.speed_of_light * constants.h / \
                constants.elementary_charge
 
-    # WDES % RSPIN = Spin multiplicity (2 for non-spin polarised)
-    spin_multiplicity = 2
+    # WDES % RSPIN = Spin multiplicity (1 for spin polarised calculation I'm testing)
+    spin_multiplicity = 1
 
-    constant = 4 * constants.pi * ry_to_ev * au_to_angstrom * spin_multiplicity / volume
+    # CELLVOL=OMEGA/AUTOA**3 (This is how the VASP code tranfroms the volume OMEGA,
+    # expressed in a.u. into angstroms; However, pymatgen uses angstroms by default,
+    # and hence this step is not needed.)
 
-    nelect = int(vasprun.parameters['NELECT'])
-    kp_wts = vasprun.actual_kpoints_weights
-    nkpts = len(kp_wts)
+    coeff = 4 * constants.pi * ry_to_ev * au_to_angstrom * spin_multiplicity / volume
 
-    eigvals = np.zeros((ispin, nkpts, nbands))
-    kp = []
-    for spin, d in vasprun.eigenvalues.items():
-        count = 0
-        for k, val in enumerate(d):
-            spinn = (str(spin[0]))
-            if spinn == '1':
-                spinn = 0
-            else:
-                spinn = 1
-            kp.append(spin[1])
-            eigvals[spinn, spin[1], count] = val[0]
-            count = count + 1
+    # Transitions is a dictionary that will keep track of all the possible transitions
+    # between the valence and conduction band, as well as their energy difference and
+    # transition amplitude. The indexing will occur in a similar manner as in the VASP
+    # code, i.e.:
+    #
+    # VASP: J = (N1 - 1) * NBCON + N2
+    #
+    # Here: transition_index = val_band * nb_cond + cond_band - nb_val + 1
+    # The changes are due to the fact that I don't want to start a new enumeration of
+    # the conduction bands, and the fact that python starts from 0
+    #
+    # with:
+    #       val_band = number of valence band
+    #       cond_band = number of conduction band
+    #       nb_cond = total number of conduction bands
+    #
+    # Besides the indexing, the keys will also contain the spin and kpoint for the
+    # transition, combined as a tuple pair. This whole procedure might not be ideal,
+    # so we'll probably change this later to make the code more clear. However,
+    # we should take care that this does not slow down the code too much.
+    #
+    transitions = {}
 
-    nb_val = int(nelect / 2.0) # This assumes a non-spin-polarized calculation
+    # Define a shorter variable for clearer code. Note that the structure of
+    # vasprun.eigenvalues is:
+    #
+    # vasprun.eigenvalues[ Spin ][ kpoint ][ band_number ][ occupancy ]
+    eig = vasprun.eigenvalues
 
-    # CELLVOL=OMEGA/AUTOA**3
+    # These loops will be quite unpythonic for now. We'll PEP it up later.
+    for spin in [Spin.up, Spin.down]:
 
-    x = []
-    y = []
-    eps = np.zeros((nedos, 3, 3))
-
-    for energy in range(0, nedos, 20):
-
-        for kpoint in range(0, nkpts):
+        for kpoint in range(0, len(kpoints)):
 
             for val_band in range(0, nb_val):
 
-                for cond_band in range(nb_val + 1, nbands + 1):
+                for cond_band in range(nb_val, nbands):
+                    # Assign the transition index
+                    transition_index = val_band * nb_cond + cond_band - nb_val + 1
+                    transition_key = (spin, kpoint, transition_index)
 
-                    band_en_diff = eigvals[0][kpoint][c] \
-                                   - eigvals[0][kpoint][vasprun] - dos_en[energy]
+                    # Calculate the difference in energy of the transition
+                    transition_en_diff = \
+                        eig[spin][kpoint][cond_band][0] - eig[spin][kpoint][val_band][0]
 
-                    tmp = 2 * kp_wts[kpoint] * cder[c][vasprun][k][0][alpha] * \
-                         np.conjugate(
-                        cder[c][vasprun][k][0][beta])
+                    if spin is Spin.up:
+                        matrix_product = np.conjugate(
+                            cder[cond_band][val_band][kpoint][0][alpha]
+                        ) * cder[cond_band][val_band][kpoint][0][beta]
+                    else:
+                        matrix_product = np.conjugate(
+                            cder[cond_band][val_band][kpoint][1][alpha]
+                        ) * cder[cond_band][val_band][kpoint][1][beta]
 
-                    eps[energy][alpha][beta] += tmp * const
+                    transition_amplitude = coeff * kp_weights[kpoint] * matrix_product
 
-        print(dos_en[energy], eps[energy][alpha][beta])
-        x.append(dos_en[energy])
-        y.append(eps[energy][alpha][beta])
+                    transitions[transition_key] = (transition_en_diff,
+                                                   transition_amplitude)
 
+    return transitions
+
+    # The VASP code, for reference:
+    #
     # CALL EPSILON_IMAG_TET(WDES, W0, CHAM(:,:,:,:, IDIR), CHAM(:,:,:,:, JDIR), EMAX, &
     # NEDOS, EPSDD(:, IDIR, JDIR), DELTAE, LATT_CUR % OMEGA, IO, INFO, KPOINTS)
     #
@@ -985,7 +1004,7 @@ def get_waveder_eps2(vasprun_file='', waveder_file='', alpha=0, beta=0):
     # NEDOS     -> number of energy gridpoints
     # DOS       -> Density of States (EPSDD(:,IDIR,JDIR) in call?)
     # DELTAE    -> Energy mesh spacing
-    # OMEGA,    -> energy grid
+    # OMEGA,    -> volume of the unit cell, expressed in a.u.
     # IO,
     # INFO,
     # KPOINTS
@@ -1032,8 +1051,8 @@ def get_waveder_eps2(vasprun_file='', waveder_file='', alpha=0, beta=0):
     #         y.append(eps[energy][alpha][beta])
 
 
-
 # Utility method
+
 def to_matrix(xx, yy, zz, xy, yz, xz):
     """
     Convert a list of matrix components to a symmetric 3x3 matrix.
@@ -1054,12 +1073,14 @@ def to_matrix(xx, yy, zz, xy, yz, xz):
     matrix = np.array([[xx, xy, xz], [xy, yy, yz], [xz, yz, zz]])
     return matrix
 
+
 # region
 ######################################
 # Previous code, kept for comparison #
 ######################################
 
-eV_to_recip_cm = 1.0 / (physical_constants['Planck constant in eV s'][0] * speed_of_light * 1e2)
+eV_to_recip_cm = 1.0 / (
+        physical_constants['Planck constant in eV s'][0] * speed_of_light * 1e2)
 
 
 def nelec_out(out=''):
@@ -1069,7 +1090,8 @@ def nelec_out(out=''):
     for i in lines:
         if 'NELECT =' in i:
             nelec = int(float(
-                i.split()[2]))  # int(i.split('NELECT =')[1].split('total number of electrons')[0])
+                i.split()[
+                    2]))  # int(i.split('NELECT =')[1].split('total number of electrons')[0])
     return nelec
 
 
@@ -1144,7 +1166,8 @@ def absorption_coefficient(dielectric):
     epsilon_1 = np.mean(real_dielectric, axis=1)
     epsilon_2 = np.mean(imag_dielectric, axis=1)
     return energies_in_eV, (2.0 * np.sqrt(2.0) * pi * eV_to_recip_cm * energies_in_eV
-                            * np.sqrt(-epsilon_1 + np.sqrt(epsilon_1 ** 2 + epsilon_2 ** 2)))
+                            * np.sqrt(
+                -epsilon_1 + np.sqrt(epsilon_1 ** 2 + epsilon_2 ** 2)))
 
 
 def optics(ru=''):
@@ -1152,7 +1175,8 @@ def optics(ru=''):
 
     run = Vasprun(ru, occu_tol=1e-2, )
     new_en, new_abs = absorption_coefficient(run.dielectric)
-    return np.array(new_en, dtype=np.float64), np.array(new_abs, dtype=np.float64), dirgap, indirgap
+    return np.array(new_en, dtype=np.float64), np.array(new_abs,
+                                                        dtype=np.float64), dirgap, indirgap
 
 
 def calculate_SQ(bandgap_ev, temperature=300, fr=1,
