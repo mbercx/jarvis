@@ -17,7 +17,7 @@ from scipy.interpolate import interp1d
 from scipy.integrate import simps
 from scipy.constants import physical_constants, speed_of_light
 from math import pi
-from monty.json import MSONable
+from monty.json import MSONable, MontyDecoder, MontyEncoder
 from monty.io import zopen
 from fnmatch import fnmatch
 from pymatgen.io.vasp.outputs import Vasprun, Outcar
@@ -105,13 +105,12 @@ class DielTensor(MSONable):
     def dielectric_function(self):
         """
         The averaged dielectric function, derived from the tensor components by
-        first diagonalizing the dielectric tensor for every energy and then
         averaging the diagonal elements.
 
         Returns:
             np.array: (N,) shaped array with the dielectric function.
         """
-        return np.array([np.mean(np.linalg.eigvals(tensor))
+        return np.array([np.mean(tensor.diagonal())
                          for tensor in self.dielectric_tensor])
 
     @property
@@ -136,7 +135,24 @@ class DielTensor(MSONable):
         energy = self.energies
         ext_coeff = np.array([cmath.sqrt(v).imag for v in self.dielectric_function])
 
-        return 2.0 * energy * ext_coeff / (constants.hbar / constants.e * constants.c)
+        return 2.0 * energy * ext_coeff / (
+                constants.hbar / constants.e * constants.c)
+
+    def add_intraband_dieltensor(self, plasma_frequency, damping=0.1):
+        """
+        Add intraband component of the dielectric tensor based on the Drude model.
+
+        Args:
+            plasma_frequency:
+            damping:
+
+        Returns:
+
+        """
+        drude_diel = self.from_drude_model(plasma_frequency=plasma_frequency,
+                                           energies=self.energies, damping=damping)
+
+        self._dielectric_tensor += drude_diel.dielectric_tensor - 1
 
     def get_absorptivity(self, thickness, method="beer-lambert"):
         """
@@ -157,6 +173,30 @@ class DielTensor(MSONable):
         else:
             raise NotImplementedError("Unrecognized method for calculating the "
                                       "absorptivity.")
+
+    def get_loss_function(self, surface=False):
+        """
+        Calculate the loss function based on the averaged dielectric function of
+        the dielectric tensor.
+
+        Args:
+            surface:
+
+        Returns:
+
+        """
+
+        er = self.dielectric_function.real
+        ei = self.dielectric_function.imag
+
+        if surface:
+            loss_function = ei / ((er + 1) ** 2 + ei ** 2)
+        else:
+            loss_function = ei / (er ** 2 + ei ** 2)
+
+        loss_function[np.isnan(loss_function)] = 0
+
+        return loss_function
 
     def plot(self, part="diel", variable_range=None, diel_range=None):
         """
@@ -233,9 +273,9 @@ class DielTensor(MSONable):
             dict: Dictionary representation of the DielTensor instance.
         """
         d = dict()
-        d["energies"] = self.energies
-        d["real_diel"] = self.dielectric_tensor.real
-        d["imag_diel"] = self.dielectric_tensor.imag
+        d["energies"] = MontyEncoder().default(self.energies)
+        d["real_diel"] = MontyEncoder().default(self.dielectric_tensor.real)
+        d["imag_diel"] = MontyEncoder().default(self.dielectric_tensor.imag)
         return d
 
     @classmethod
@@ -250,9 +290,9 @@ class DielTensor(MSONable):
             DielTensor
 
         """
-        energies = np.array(d["energies"]["data"])
-        real_diel = np.array(d["real_diel"]["data"])
-        imag_diel = np.array(d["imag_diel"]["data"])
+        energies = MontyDecoder().process_decoded(d["energies"])
+        real_diel = MontyDecoder().process_decoded(d["real_diel"])
+        imag_diel = MontyDecoder().process_decoded(d["imag_diel"])
         return cls(energies, real_diel + 1j * imag_diel)
 
     def to(self, filename):
@@ -288,6 +328,7 @@ class DielTensor(MSONable):
         """
         # Vasprun format: dielectric data is length 3 tuple
         if fmt == "vasprun" or filename.endswith(".xml"):
+
             dielectric_data = Vasprun(filename, parse_potcar_file=False).dielectric
 
             energies = np.array(dielectric_data[0])
@@ -312,6 +353,33 @@ class DielTensor(MSONable):
         else:
             raise IOError("Format of file not recognized. Note: Currently "
                           "only vasprun.xml and OUTCAR files are supported.")
+
+    @classmethod
+    def from_drude_model(cls, plasma_frequency, energies, damping=0.05):
+        """
+        Initialize a DielTensor object based on the Drude model for metals.
+
+        Returns:
+
+        """
+
+        try:
+            if not plasma_frequency.shape == (3, 3):
+                raise ValueError("Plasma frequency array does not have right shape!")
+        except AttributeError:
+            if isinstance(plasma_frequency, float):
+                plasma_frequency *= np.eye(3)
+            else:
+                raise TypeError("The plasma frequency must be expressed either as "
+                                "a float or a numpy array of shape (3, 3).")
+
+        dieltensor = np.array(
+            [1 - omega ** 2 / (energies ** 2 + 1j * energies * damping)
+             for omega in plasma_frequency.reshape(9)]
+        ).reshape((3, 3, len(energies)))
+        dieltensor = dieltensor.swapaxes(0, 2)
+
+        return cls(energies, dieltensor)
 
 
 class EMRadSpectrum(MSONable):
@@ -616,7 +684,8 @@ class SolarCell(MSONable):
             EMRadSpectrum.get_solar_spectrum("am1.5g").get_interp_function()(energy)
 
         # Calculation of energy-dependent blackbody spectrum (~m^{-2}s^{-1}eV^{-1})
-        blackbody_spectrum = EMRadSpectrum.get_blackbody(temperature, energy).photon_flux
+        blackbody_spectrum = EMRadSpectrum.get_blackbody(temperature,
+                                                         energy).photon_flux
 
         # Numerically integrating photon flux over energy grid
         j_0_r = e * np.pi * simps(blackbody_spectrum * absorptivity, energy)
@@ -674,7 +743,8 @@ class SolarCell(MSONable):
         """
         thickness = 10 ** np.linspace(-9, -3, 40)
         efficiency = np.array([self.slme(thickness=d, temperature=temperature,
-                                         cut_abs_below_bandgap=cut_abs_below_bandgap)[0]
+                                         cut_abs_below_bandgap=cut_abs_below_bandgap)[
+                                   0]
                                for d in thickness])
 
         plt.plot(thickness, efficiency)
@@ -829,7 +899,8 @@ class SolarCell(MSONable):
             EMRadSpectrum.get_solar_spectrum("am1.5g").get_interp_function()(energy)
 
         # Calculation of energy-dependent blackbody spectrum, in units of W / m**2
-        blackbody_spectrum = EMRadSpectrum.get_blackbody(temperature, energy).photon_flux
+        blackbody_spectrum = EMRadSpectrum.get_blackbody(temperature,
+                                                         energy).photon_flux
 
         # Numerically integrating irradiance over energy grid ~ A/m**2
         j_0_r = e * np.pi * simps(blackbody_spectrum * absorptivity, energy)
@@ -867,7 +938,8 @@ def kkr(de, eps_imag, cshift=1e-6):
         for i_i in range(nedos):
             w_i = de * i_i
             val = eps_imag[i_i] * ((1. / (w_r - w_i - complex(0, cshift)))
-                                   + (1. / (- w_r - w_i + complex(0, cshift)))) * (-0.5)
+                                   + (1. / (- w_r - w_i + complex(0, cshift)))) * (
+                      -0.5)
             total += val
         eps_real.append(total * (2 / np.pi) * de + np.diag([1, 1, 1]))
     return np.real(np.array(eps_real))
@@ -877,11 +949,13 @@ def get_waveder_eps2(vasprun_file='', waveder_file='', alpha=0, beta=0):
     """
     alpha, beta: cartesian directions
     """
-    warnings.warn("This code is still under heavy development and should be used with "
-                  "care.", Warning)
+    warnings.warn(
+        "This code is still under heavy development and should be used with "
+        "care.", Warning)
 
     with FortranFile(waveder_file, 'r') as waveder:
-        (nbands, nbands_cder, number_kpoints, ispin) = waveder.read_reals(dtype=np.int32)
+        (nbands, nbands_cder, number_kpoints, ispin) = waveder.read_reals(
+            dtype=np.int32)
         nodes_in_dielectric_function = waveder.read_reals(dtype=np.float)
         wplasmon = (waveder.read_reals(dtype=np.float))
         cder = np.array((waveder.read_reals(dtype=np.float)))
@@ -962,7 +1036,8 @@ def get_waveder_eps2(vasprun_file='', waveder_file='', alpha=0, beta=0):
 
                     # Calculate the difference in energy of the transition
                     transition_en_diff = \
-                        eig[spin][kpoint][cond_band][0] - eig[spin][kpoint][val_band][0]
+                        eig[spin][kpoint][cond_band][0] - \
+                        eig[spin][kpoint][val_band][0]
 
                     # Calculate the transition amplitude
                     if spin is Spin.up:
@@ -974,7 +1049,8 @@ def get_waveder_eps2(vasprun_file='', waveder_file='', alpha=0, beta=0):
                             cder[cond_band][val_band][kpoint][1][alpha]
                         ) * cder[cond_band][val_band][kpoint][1][beta]
 
-                    transition_amplitude = coeff * kp_weights[kpoint] * matrix_product
+                    transition_amplitude = coeff * kp_weights[
+                        kpoint] * matrix_product
 
                     transitions[transition_key] = (transition_en_diff,
                                                    transition_amplitude)
@@ -1112,7 +1188,8 @@ def get_dir_indir_gap(run='', ispin=1):
             eigvals[0, kp, band] = j[0]
     noso_homo = np.max(eigvals[0, :, nelec // 2 - 1])
     noso_lumo = np.min(eigvals[0, :, nelec // 2])
-    noso_indir = np.min(eigvals[0, :, nelec // 2]) - np.max(eigvals[0, :, nelec // 2 - 1])
+    noso_indir = np.min(eigvals[0, :, nelec // 2]) - np.max(
+        eigvals[0, :, nelec // 2 - 1])
     noso_direct = np.min(eigvals[0, :, nelec // 2] - eigvals[0, :, nelec // 2 - 1])
     print('noso_direct,noso_indir', noso_direct, noso_indir)
     return noso_direct, noso_indir
@@ -1199,7 +1276,8 @@ def calculate_SQ(bandgap_ev, temperature=300, fr=1,
     e = constants.e  # Coulomb
 
     # Load the Air Mass 1.5 Global tilt solar spectrum
-    solar_spectrum_data_file = str(os.path.join(os.path.dirname(__file__), "am1.5g.dat"))
+    solar_spectrum_data_file = str(
+        os.path.join(os.path.dirname(__file__), "am1.5g.dat"))
     solar_spectra_wavelength, solar_spectra_irradiance = np.loadtxt(
         solar_spectrum_data_file, usecols=[0, 1], unpack=True, skiprows=2
     )
@@ -1238,7 +1316,8 @@ def calculate_SQ(bandgap_ev, temperature=300, fr=1,
 
     # Only take the part of the wavelength-dependent solar spectrum and
     # blackbody spectrum below the bandgap wavelength
-    bandgap_index = np.searchsorted(solar_spectra_wavelength_meters, bandgap_wavelength)
+    bandgap_index = np.searchsorted(solar_spectra_wavelength_meters,
+                                    bandgap_wavelength)
 
     bandgap_irradiance = interp(
         np.array([bandgap_wavelength, ]), solar_spectra_wavelength_meters,
@@ -1362,7 +1441,8 @@ def slme(material_energy_for_absorbance_data,
         material_absorbance_data = material_absorbance_data * 100
 
     # Load the Air Mass 1.5 Global tilt solar spectrum
-    solar_spectrum_data_file = str(os.path.join(os.path.dirname(__file__), "am1.5g.dat"))
+    solar_spectrum_data_file = str(
+        os.path.join(os.path.dirname(__file__), "am1.5g.dat"))
 
     solar_spectra_wavelength, solar_spectra_irradiance = np.loadtxt(
         solar_spectrum_data_file, usecols=[0, 1], unpack=True, skiprows=2
